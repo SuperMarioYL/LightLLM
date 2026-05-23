@@ -14,7 +14,7 @@ from lightllm.utils.dist_utils import get_current_rank_in_node, get_node_world_s
 from lightllm.utils.envs_utils import get_unique_server_name, get_env_start_args
 from lightllm.distributed.pynccl import PyNcclCommunicator
 from lightllm.utils.dist_utils import get_current_device_id
-from lightllm.utils.config_utils import get_num_key_value_heads
+from lightllm.utils.config_utils import get_num_key_value_heads, get_vocab_size
 from lightllm.common.kv_trans_kernel.nixl_kv_trans import page_io
 from lightllm.utils.device_utils import kv_trans_use_p2p
 from lightllm.utils.shm_utils import create_or_link_shm
@@ -61,14 +61,28 @@ class MemoryManager:
     def get_cell_size(self):
         return 2 * self.head_num * self.head_dim * self.layer_num * torch._utils._element_size(self.dtype)
 
+    def get_req_manager_reserve_bytes(self):
+        args = get_env_start_args()
+        max_request_num = args.running_max_req_size + 8
+        max_sequence_length = max(args.batch_max_tokens or 0, (args.max_req_total_len or 0) + 8)
+        req_state_num = max_request_num + 1
+
+        reserve_bytes = req_state_num * max_sequence_length * torch._utils._element_size(torch.int32)
+        reserve_bytes += req_state_num * 4 * torch._utils._element_size(torch.float32)
+        reserve_bytes += req_state_num * 8 * torch._utils._element_size(torch.int64)
+        if args.penalty_counter_mode == "gpu_counter":
+            reserve_bytes += req_state_num * get_vocab_size(args.model_dir) * torch._utils._element_size(torch.int32)
+        return reserve_bytes
+
     def profile_size(self, mem_fraction):
         if self.size is not None:
             return
 
         torch.cuda.empty_cache()
         world_size = dist.get_world_size()
-
-        available_memory = get_available_gpu_memory(world_size) * mem_fraction
+        available_memory = get_available_gpu_memory(world_size) - get_total_gpu_memory() * (1 - mem_fraction)
+        req_manager_reserve_gb = self.get_req_manager_reserve_bytes() / (1024 ** 3)
+        available_memory -= req_manager_reserve_gb
         cell_size = self.get_cell_size()
         self.size = int(available_memory * 1024 ** 3 / cell_size)
         if world_size > 1:
@@ -76,7 +90,8 @@ class MemoryManager:
             dist.all_reduce(tensor, op=dist.ReduceOp.MIN)
             self.size = tensor.item()
         logger.info(
-            f"{str(available_memory)} GB space is available after load the model weight\n"
+            f"{str(available_memory)} GB space is available after load the model weight "
+            f"and reserve {req_manager_reserve_gb} GB for req_manager\n"
             f"{str(cell_size / 1024 ** 2)} MB is the size of one token kv cache\n"
             f"{self.size} is the profiled max_total_token_num with the mem_fraction {mem_fraction}\n"
         )

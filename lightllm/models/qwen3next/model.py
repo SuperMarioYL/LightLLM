@@ -89,6 +89,7 @@ class Qwen3NextTpPartModel(Qwen3MOEModel):
         )
 
     def _init_req_manager(self):
+        self._safe_clamp_auto_max_req_total_len()
         create_max_seq_len = 0
 
         if self.batch_max_tokens is not None:

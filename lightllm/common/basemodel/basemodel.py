@@ -23,6 +23,7 @@ from lightllm.common.basemodel.cuda_graph import CudaGraph
 from lightllm.common.basemodel.prefill_cuda_graph import PrefillCudaGraph
 from lightllm.common.quantization import Quantcfg
 from lightllm.common.basemodel.triton_kernel.gather_token_id import gather_token, gather_token_prefill_decode_mixed
+from lightllm.utils.config_utils import _derive_max_req_total_len_from_model_config
 from lightllm.utils.log_utils import init_logger
 from lightllm.utils.dist_utils import get_dp_world_size
 from lightllm.utils.envs_utils import get_env_start_args, get_llm_data_type, get_added_mtp_kv_layer_num
@@ -105,8 +106,8 @@ class TpPartBaseModel:
         self._init_quant()
 
         self._init_weights()
-        self._init_req_manager()
         self._init_mem_manager()
+        self._init_req_manager()
         # 因为类似 qwen3.5 的linear 架构的模型，其 req_manager 会存储运行时使用的大量 linear state
         # 这可能会占用大量的显存，所以，req_manger 中保存的 mem_manger 是mem manager 初始化后再赋值
         self.req_manager.mem_manager = self.mem_manager
@@ -210,6 +211,26 @@ class TpPartBaseModel:
         if self.run_mode in ["prefill", "decode"]:
             self.mem_manager.alloc_kv_move_buffer(self.mem_manager.size)
 
+    # 推导出的max_req_total_len如果显存预算支持不了，需要进一步截断到可支持的长度
+    def _safe_clamp_auto_max_req_total_len(self):
+        max_total_token_num = self.mem_manager.size
+        if self.max_seq_length is None or self.max_seq_length <= max_total_token_num:
+            return
+
+        # 只截断推导生成的max_req_total_len
+        old_max_req_total_len = self.max_seq_length - 8
+        derived_max_req_total_len = _derive_max_req_total_len_from_model_config(self.weight_dir_)
+        if derived_max_req_total_len is None or old_max_req_total_len != derived_max_req_total_len:
+            return
+
+        supported_max_req_total_len = max(max_total_token_num - 8, 1)
+        self.args.max_req_total_len = supported_max_req_total_len
+        self.max_seq_length = supported_max_req_total_len + 8
+
+        if self.graph_max_len_in_batch == old_max_req_total_len:
+            self.args.graph_max_len_in_batch = min(self.args.graph_max_len_in_batch, supported_max_req_total_len)
+            self.graph_max_len_in_batch = self.args.graph_max_len_in_batch
+
     def _check_mem_size(self):
         self.max_total_token_num = self.mem_manager.size
 
@@ -232,6 +253,7 @@ class TpPartBaseModel:
         return
 
     def _init_req_manager(self):
+        self._safe_clamp_auto_max_req_total_len()
         create_max_seq_len = 0
 
         if self.batch_max_tokens is not None:

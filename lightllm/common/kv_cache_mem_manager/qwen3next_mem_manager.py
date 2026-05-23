@@ -1,8 +1,11 @@
 import torch
+import torch.distributed as dist
 import triton
 from lightllm.utils.log_utils import init_logger
 from lightllm.common.kv_cache_mem_manager.mem_manager import MemoryManager
 from lightllm.utils.envs_utils import get_env_start_args
+from lightllm.utils.dist_utils import get_current_device_id
+from lightllm.utils.profile_max_tokens import get_available_gpu_memory, get_total_gpu_memory
 from lightllm.common.linear_att_cache_manager import LinearAttCacheConfig, LinearAttCacheManager
 from .operator import LinearAttMemOperator
 from typing import Tuple, Any
@@ -31,6 +34,38 @@ class Qwen3NextMemManager(MemoryManager):
     def get_att_input_params(self, layer_index: int) -> Tuple[Any, Any]:
         layer_index = layer_index // self.linear_config.full_attention_interval
         return super().get_att_input_params(layer_index)
+
+    def profile_size(self, mem_fraction):
+        if self.size is not None:
+            return
+
+        torch.cuda.empty_cache()
+        args = get_env_start_args()
+        reserve_bytes = self.get_req_manager_reserve_bytes()
+        req_state_num = (args.running_max_req_size + 8 + 1) * (args.mtp_step + 1)
+        reserve_bytes += (
+            req_state_num
+            * self.linear_config.linear_layer_num
+            * (self.linear_config.get_conv_state_bytes_per_layer() + self.linear_config.get_ssm_state_bytes_per_layer())
+        )
+        reserve_gb = reserve_bytes / (1024 ** 3)
+
+        world_size = dist.get_world_size()
+        available_memory = get_available_gpu_memory(world_size) - get_total_gpu_memory() * (1 - mem_fraction)
+        available_memory -= reserve_gb
+        cell_size = self.get_cell_size()
+        self.size = max(int(available_memory * 1024 ** 3 / cell_size), 1)
+        if world_size > 1:
+            tensor = torch.tensor(self.size, dtype=torch.int64, device=f"cuda:{get_current_device_id()}")
+            dist.all_reduce(tensor, op=dist.ReduceOp.MIN)
+            self.size = tensor.item()
+        logger.info(
+            f"{str(available_memory)} GB space is available after load the model weight "
+            f"and reserve {reserve_gb} GB for qwen3next req_manager\n"
+            f"{str(cell_size / 1024 ** 2)} MB is the size of one token kv cache\n"
+            f"{self.size} is the profiled max_total_token_num with the mem_fraction {mem_fraction}\n"
+        )
+        return
 
     def _init_buffers(self, size, dtype, head_num, head_dim, layer_num):
         super()._init_buffers(size, dtype, head_num, head_dim, layer_num)
