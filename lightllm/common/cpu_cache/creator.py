@@ -1,7 +1,6 @@
 import ctypes
 import torch
 import numpy as np
-import time
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from lightllm.utils.kv_cache_utils import attach_shm_kv_cache_ptr, create_shm_kv_cache_ptr, register_shm_ptr_to_pin
@@ -33,12 +32,8 @@ class CpuCacheCreator:
             if not pin_no_blocking:
                 attach_handle.wait()
 
-            # 等待 device_ptr 被赋值
-            while attach_handle.device_ptr is None:
-                time.sleep(0.01)
-
-            cpu_cache_tensor = self._build_tensor_view(shm_ptr=attach_handle.device_ptr)
-            assert attach_handle.device_ptr == cpu_cache_tensor.data_ptr()
+            cpu_cache_tensor = self._build_tensor_view(shm_ptr=shm_ptr)
+            assert shm_ptr == cpu_cache_tensor.data_ptr()
             return cpu_cache_tensor, attach_handle
         else:
             cpu_cache_tensor = self._build_tensor_view(shm_ptr=shm_ptr)

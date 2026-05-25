@@ -246,7 +246,7 @@ def create_shm_kv_cache_ptr(key: int, size: int) -> int:
 
 @lru_cache(maxsize=None)
 def register_shm_ptr_to_pin(shm_ptr: int, size: int) -> "AsyncRegistrationHandle":
-    """Start async cudaHostRegister on the given [shm_ptr, shm_ptr+size) and return a handle."""
+    """Create a lazy cudaHostRegister handle for the given [shm_ptr, shm_ptr+size)."""
     chunk_bytes = 128 * 1024 * 1024  # 128M性能最好
     tasks: list[tuple[int, int]] = []
     offset = 0
@@ -275,24 +275,17 @@ def register_shm_ptr_to_pin(shm_ptr: int, size: int) -> "AsyncRegistrationHandle
                 raise Exception(f"cudaHostRegister failed with error code {r}, prefer to use hugetlb")
             handle.task_count += 1
 
-            if handle.device_ptr is None:
-                # 提前获取对应的指针对象，避免在wait后再获取，照成过长的阻塞等待。
-                device_ptr = ctypes.c_void_p()
-                host_ptr = ctypes.c_void_p(shm_ptr)
-                res = cuda.cudaHostGetDevicePointer(ctypes.byref(device_ptr), host_ptr, 0)
-                if res != 0:
-                    raise Exception(f"cudaHostGetDevicePointer failed with error code {res}")
-
-                logger.info(
-                    f"cudaHostGetDevicePointer success, host_ptr={host_ptr.value}, device_ptr={device_ptr.value}"
-                )
-                handle.device_ptr = device_ptr.value
+        device_ptr = ctypes.c_void_p()
+        host_ptr = ctypes.c_void_p(shm_ptr)
+        res = cuda.cudaHostGetDevicePointer(ctypes.byref(device_ptr), host_ptr, 0)
+        if res != 0:
+            raise Exception(f"cudaHostGetDevicePointer failed with error code {res}")
+        assert host_ptr.value == device_ptr.value
 
         handle.tasks_finished.set()
 
     th = threading.Thread(target=_worker, name=f"cpu_cache_register_{shm_ptr}", daemon=True)
     handle.thread = th
-    th.start()
     return handle
 
 
@@ -307,10 +300,20 @@ class AsyncRegistrationHandle:
         self.task_count = 0
         self.thread: Optional[threading.Thread] = None
         self.tasks_finished = threading.Event()
-        self.device_ptr: Optional[int] = None
+        self._start_lock = threading.Lock()
+        self._started = False
+
+    def start(self):
+        with self._start_lock:
+            if not self._started:
+                assert self.thread is not None
+                self.thread.start()
+                self._started = True
+        return
 
     def wait(self):
         """Block until the async registration completes. Only here we print tqdm progress."""
+        self.start()
         last_count = 0
         desc = f"pid {os.getpid()} Registering pinned host memory (async)"
         with tqdm(total=self.total_tasks, desc=desc) as pbar:
